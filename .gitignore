@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtualenv
+.venv/
+venv/
+
+# Datos sensibles
+data/*.xlsx
+*.xlsx
+
+# Outputs grandes (se versionan solo históricos clave)
+out/report_*.csv
+out/targets_*.csv
+out/pending_verify.csv
+
+# OS / Editor
+.DS_Store
+Thumbs.db
+.vscode/
+
+# Logs
+*.log
+
+# CSV descargados automáticamente
+data/*.csv
