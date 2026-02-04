@@ -38,6 +38,13 @@ jobs:
           MNG_BASE_URL: "https://console.monogoto.io"
           SMS_COMMAND: "AT+GTDAT=gv300w,1,,CMD2112,0,,,,FFFF$"
         run: python scripts/send_daily.py
+      
+      - name: Debug list files
+        run: |
+          pwd
+          ls -la
+          ls -la scripts
+
 
       - name: Upload run reports as artifact
         uses: actions/upload-artifact@v4

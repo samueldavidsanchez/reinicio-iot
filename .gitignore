@@ -27,3 +27,6 @@ Thumbs.db
 
 # CSV descargados automáticamente
 data/*.csv
+
+!data/master_status.xlsx
+!data/historical_data.xlsx
