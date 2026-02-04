@@ -1,23 +1,24 @@
 name: IoT Reboot (Send + Verify)
 
-name: IoT Reboot (Send + Verify)
-
 permissions:
   contents: write
 
 on:
   schedule:
+    # Envío diario (12:10 UTC ≈ 09:10 Chile si UTC-3)
     - cron: "10 12 * * *"
+    # Verificación cada hora al minuto 20
     - cron: "20 * * * *"
-  workflow_dispatch:
-
+  workflow_dispatch: {}
 
 jobs:
   send_daily:
     name: Send daily SMS resets
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     # Corre solo en el cron diario o manual
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event.schedule == '15 06 * * *' }}
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.schedule == '10 12 * * *' }}
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -31,7 +32,17 @@ jobs:
           python-version: "3.11"
 
       - name: Install deps
-        run: pip install -r requirements.txt
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Debug list files
+        run: |
+          pwd
+          ls -la
+          ls -la scripts || true
+          ls -la data || true
+          ls -la out || true
 
       - name: Run send_daily
         env:
@@ -42,13 +53,6 @@ jobs:
           MNG_BASE_URL: "https://console.monogoto.io"
           SMS_COMMAND: "AT+GTDAT=gv300w,1,,CMD2112,0,,,,FFFF$"
         run: python scripts/send_daily.py
-      
-      - name: Debug list files
-        run: |
-          pwd
-          ls -la
-          ls -la scripts
-
 
       - name: Upload run reports as artifact
         uses: actions/upload-artifact@v4
@@ -70,8 +74,10 @@ jobs:
   verify_hourly:
     name: Verify delivery status (searchCDR)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     # Corre solo en el cron horario o manual
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event.schedule == '10 * * * *' }}
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.schedule == '20 * * * *' }}
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -85,13 +91,15 @@ jobs:
           python-version: "3.11"
 
       - name: Install deps
-        run: pip install -r requirements.txt
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
       - name: Run verify_hourly
         env:
           MONOGOTO_USER: ${{ secrets.MONOGOTO_USER }}
           MONOGOTO_PASS: ${{ secrets.MONOGOTO_PASS }}
-          MONOGOTO_APIKEY: ${{ secrets.MONOGOTO_APIKEY }}  # <- Customer ID / apikey para searchCDR
+          MONOGOTO_APIKEY: ${{ secrets.MONOGOTO_APIKEY }}
           MNG_BASE_URL: "https://console.monogoto.io"
         run: python scripts/verify_hourly.py
 
