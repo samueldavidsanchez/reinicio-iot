@@ -30,3 +30,4 @@ data/*.csv
 
 !data/master_status.xlsx
 !data/historical_data.xlsx
+!out/pending_verify.csv
