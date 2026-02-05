@@ -16,7 +16,6 @@ jobs:
     name: Send daily SMS resets
     runs-on: ubuntu-latest
     timeout-minutes: 45
-    # Corre solo en el cron diario o manual
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.schedule == '10 12 * * *' }}
 
     steps:
@@ -64,20 +63,32 @@ jobs:
 
       - name: Commit updated history files
         run: |
+          set -e
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+
           git add out/historico_reincidencia.csv out/sent_commands.csv || true
           git diff --cached --quiet && echo "No changes to commit" && exit 0
           git commit -m "Update IoT reboot history (send_daily)"
-          git push
+
+          for i in 1 2 3; do
+            git fetch origin main
+            git rebase origin/main || (git rebase --abort && exit 1)
+            if git push origin HEAD:main; then
+              exit 0
+            fi
+            echo "Push failed (attempt $i). Retrying in 5s..."
+            sleep 5
+          done
+
+          echo "Push failed after retries"
+          exit 1
 
   verify_hourly:
     name: Verify delivery status (searchCDR)
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    # Corre solo en el cron horario o manual
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.schedule == '20 * * * *' }}
-    
 
     steps:
       - name: Checkout
@@ -104,18 +115,17 @@ jobs:
           MNG_BASE_URL: "https://console.monogoto.io"
         run: python scripts/verify_hourly.py
 
-           - name: Commit updated history files
+      - name: Commit updated history files
         run: |
           set -e
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          git add out/historico_reincidencia.csv out/sent_commands.csv || true
+          # verify normalmente solo actualiza el histórico
+          git add out/historico_reincidencia.csv || true
           git diff --cached --quiet && echo "No changes to commit" && exit 0
+          git commit -m "Update IoT reboot history (verify_hourly)"
 
-          git commit -m "Update IoT reboot history (send_daily)"
-
-          # Trae cambios remotos y reintenta push (evita fetch-first)
           for i in 1 2 3; do
             git fetch origin main
             git rebase origin/main || (git rebase --abort && exit 1)
