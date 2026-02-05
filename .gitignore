@@ -15,7 +15,10 @@ data/*.xlsx
 # Outputs grandes (se versionan solo históricos clave)
 out/report_*.csv
 out/targets_*.csv
+out/vehicle_records.csv
 out/pending_verify.csv
+!out/historico_reincidencia.csv
+!out/sent_commands.csv
 
 # OS / Editor
 .DS_Store
@@ -31,3 +34,5 @@ data/*.csv
 !data/master_status.xlsx
 !data/historical_data.xlsx
 !out/pending_verify.csv
+
+
