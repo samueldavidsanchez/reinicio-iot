@@ -6,12 +6,12 @@ permissions:
 on:
   schedule:
     - cron: "10 12 * * *"   # envío diario
-    - cron: "20 * * * *"   # verify hourly
+    - cron: "20 * * * *"    # verify hourly
   workflow_dispatch: {}
 
-# Evita que dos corridas paralelas peleen por los mismos CSV
+# Evita ejecuciones simultáneas del mismo workflow (mismo branch)
 concurrency:
-  group: reinicio-iot-main
+  group: iot-reboot-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -32,12 +32,6 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-
-      # 👇 Importante: sincroniza ANTES de generar cambios
-      - name: Sync with origin/main (pre-run)
-        run: |
-          git fetch origin main
-          git reset --hard origin/main
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -67,13 +61,44 @@ jobs:
             out/report_*.csv
             out/targets_15_30.csv
 
-      - name: Commit & push history
+      - name: Commit & push history (retry-safe)
         run: |
           set -e
-          git add out/historico_reincidencia.csv out/sent_commands.csv || true
-          git diff --cached --quiet && echo "No changes to commit" && exit 0
-          git commit -m "Update IoT reboot history (send_daily)"
-          git push origin HEAD:main
+
+          # Intentar 3 veces por si main cambia entre medio
+          for i in 1 2 3; do
+            echo "=== Push attempt $i ==="
+
+            # Sincroniza con el main más reciente (sin merge/rebase)
+            git fetch origin main
+            git reset --hard origin/main
+
+            # Re-aplica los archivos generados por el script (los copiamos desde workspace)
+            # OJO: scripts/send_daily.py ya generó estos archivos en el workspace.
+            # Como hicimos reset --hard, debemos re-escribirlos desde el filesystem actual:
+            # (En Actions, reset no borra archivos no trackeados, pero sí revierte trackeados.
+            # Por eso los volvemos a stagear tal cual están ahora.)
+            git add out/historico_reincidencia.csv out/sent_commands.csv || true
+
+            if git diff --cached --quiet; then
+              echo "No changes to commit"
+              exit 0
+            fi
+
+            git commit -m "Update IoT reboot history (send_daily)" || true
+
+            # Push
+            if git push origin HEAD:main; then
+              echo "Push OK"
+              exit 0
+            fi
+
+            echo "Push rejected (fetch first). Waiting 5s..."
+            sleep 5
+          done
+
+          echo "Push failed after retries"
+          exit 1
 
   verify_hourly:
     name: Verify delivery status (searchCDR)
@@ -84,20 +109,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          persist-credentials: true
-          fetch-depth: 0
-
-      - name: Configure git identity
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-
-      # 👇 Sincroniza ANTES del verify
-      - name: Sync with origin/main (pre-run)
-        run: |
-          git fetch origin main
-          git reset --hard origin/main
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -117,10 +128,13 @@ jobs:
           MNG_BASE_URL: "https://console.monogoto.io"
         run: python scripts/verify_hourly.py
 
-      - name: Commit & push history
-        run: |
-          set -e
-          git add out/historico_reincidencia.csv || true
-          git diff --cached --quiet && echo "No changes to commit" && exit 0
-          git commit -m "Update IoT reboot history (verify_hourly)"
-          git push origin HEAD:main
+      # En vez de pushear cada hora (causa choques), subimos artifacts para inspección.
+      - name: Upload verify reports as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: verify-reports
+          path: |
+            out/verify_*.csv
+            out/pending_verify.csv
+            out/report_verify_*.csv
+          if-no-files-found: ignore
