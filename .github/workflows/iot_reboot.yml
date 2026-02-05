@@ -16,6 +16,7 @@ jobs:
     name: Send daily SMS resets
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    # Corre solo en el cron diario o manual
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.schedule == '10 12 * * *' }}
 
     steps:
@@ -67,10 +68,16 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
+          # Stage SOLO lo que queremos versionar
           git add out/historico_reincidencia.csv out/sent_commands.csv || true
           git diff --cached --quiet && echo "No changes to commit" && exit 0
           git commit -m "Update IoT reboot history (send_daily)"
 
+          # Limpia cambios no-stageados generados por el job (csv descargados, logs, etc.)
+          git reset --hard
+          git clean -fd
+
+          # Reintento push con rebase (evita fetch-first)
           for i in 1 2 3; do
             git fetch origin main
             git rebase origin/main || (git rebase --abort && exit 1)
@@ -88,6 +95,7 @@ jobs:
     name: Verify delivery status (searchCDR)
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    # Corre solo en el cron horario o manual
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.schedule == '20 * * * *' }}
 
     steps:
@@ -125,6 +133,10 @@ jobs:
           git add out/historico_reincidencia.csv || true
           git diff --cached --quiet && echo "No changes to commit" && exit 0
           git commit -m "Update IoT reboot history (verify_hourly)"
+
+          # Limpia cambios no-stageados
+          git reset --hard
+          git clean -fd
 
           for i in 1 2 3; do
             git fetch origin main
