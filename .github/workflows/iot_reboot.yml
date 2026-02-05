@@ -77,6 +77,7 @@ jobs:
     timeout-minutes: 30
     # Corre solo en el cron horario o manual
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.schedule == '20 * * * *' }}
+    
 
     steps:
       - name: Checkout
