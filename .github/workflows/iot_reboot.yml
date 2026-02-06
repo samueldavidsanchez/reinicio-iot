@@ -5,11 +5,10 @@ permissions:
 
 on:
   schedule:
-    - cron: "00 15 * * *"   # envío diario
+    - cron: "00 15 * * *"   # envío diario (15:00 UTC = 12:00 Chile en UTC-3)
     - cron: "20 * * * *"    # verify hourly
   workflow_dispatch: {}
 
-# Evita ejecuciones simultáneas del mismo workflow (mismo branch)
 concurrency:
   group: iot-reboot-${{ github.ref }}
   cancel-in-progress: false
@@ -19,7 +18,7 @@ jobs:
     name: Send daily SMS resets
     runs-on: ubuntu-latest
     timeout-minutes: 45
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event.schedule == '10 12 * * *' }}
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.schedule == '00 15 * * *' }}
 
     steps:
       - name: Checkout
@@ -64,22 +63,12 @@ jobs:
       - name: Commit & push history (retry-safe)
         run: |
           set -e
-
-          # Intentar 3 veces por si main cambia entre medio
           for i in 1 2 3; do
             echo "=== Push attempt $i ==="
-
-            # Sincroniza con el main más reciente (sin merge/rebase)
             git fetch origin main
             git reset --hard origin/main
 
-            # Re-aplica los archivos generados por el script (los copiamos desde workspace)
-            # OJO: scripts/send_daily.py ya generó estos archivos en el workspace.
-            # Como hicimos reset --hard, debemos re-escribirlos desde el filesystem actual:
-            # (En Actions, reset no borra archivos no trackeados, pero sí revierte trackeados.
-            # Por eso los volvemos a stagear tal cual están ahora.)
             git add out/historico_reincidencia.csv out/sent_commands.csv || true
-
             if git diff --cached --quiet; then
               echo "No changes to commit"
               exit 0
@@ -87,7 +76,6 @@ jobs:
 
             git commit -m "Update IoT reboot history (send_daily)" || true
 
-            # Push
             if git push origin HEAD:main; then
               echo "Push OK"
               exit 0
@@ -96,7 +84,6 @@ jobs:
             echo "Push rejected (fetch first). Waiting 5s..."
             sleep 5
           done
-
           echo "Push failed after retries"
           exit 1
 
@@ -128,7 +115,6 @@ jobs:
           MNG_BASE_URL: "https://console.monogoto.io"
         run: python scripts/verify_hourly.py
 
-      # En vez de pushear cada hora (causa choques), subimos artifacts para inspección.
       - name: Upload verify reports as artifact
         uses: actions/upload-artifact@v4
         with:
