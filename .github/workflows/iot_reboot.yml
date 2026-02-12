@@ -22,7 +22,6 @@ jobs:
     name: Send reboot commands (15-30 days)
     runs-on: ubuntu-latest
     timeout-minutes: 45
-    # Solo correr este job en el cron diario de 15:00 UTC o manual
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.schedule == '0 15 * * *' }}
 
     env:
@@ -58,7 +57,7 @@ jobs:
 
       - name: Run daily reboot script
         run: |
-          python reinicio/scripts/send_daily.py
+          python scripts/send_daily.py
 
       - name: Commit generated reports (if changed)
         run: |
@@ -72,7 +71,6 @@ jobs:
     name: Verify reconnection (2x/day)
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    # Solo correr este job en el cron 0 */12 o manual
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.schedule == '0 */12 * * *' }}
 
     env:
@@ -81,7 +79,7 @@ jobs:
       COPILOTO_SIGNIN_URL: https://accounts.copiloto.ai/v1/sign-in
 
       HTTP_TIMEOUT: "20"
-      VERIFY_MAX_HOURS_WAIT: "72"  # marca NO_RECONNECT si pasan 72h
+      VERIFY_MAX_HOURS_WAIT: "72"
 
     steps:
       - name: Checkout repo
@@ -102,7 +100,7 @@ jobs:
 
       - name: Run verify reconnect
         run: |
-          python reinicio/scripts/verify_reconnect.py
+          python scripts/verify_reconnect.py
 
       - name: Commit verify results (if changed)
         run: |
