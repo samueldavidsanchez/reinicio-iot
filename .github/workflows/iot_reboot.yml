@@ -5,36 +5,45 @@ permissions:
 
 on:
   schedule:
-    # Send daily: 12:00 Chile continental ≈ 15:00 UTC
+    # 12:00 Chile ≈ 15:00 UTC
     - cron: "0 15 * * *"
-
-    # Verify twice a day (every 12 hours): 00:00 and 12:00 UTC
-    - cron: "0 */12 * * *"
-
+    # 18:00 Chile ≈ 21:00 UTC
+    - cron: "0 21 * * *"
   workflow_dispatch: {}
 
 concurrency:
   group: iot-reboot-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
-  send_daily:
-    name: Send reboot commands (15-30 days)
+  send_twice_daily:
+    name: Send reset commands (2x/day)
     runs-on: ubuntu-latest
     timeout-minutes: 45
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event.schedule == '0 15 * * *' }}
 
     env:
+      # =========================
+      # Copiloto Auth
+      # =========================
       COPILOTO_EMAIL: ${{ secrets.COPILOTO_EMAIL }}
       COPILOTO_PASSWORD: ${{ secrets.COPILOTO_PASSWORD }}
       COPILOTO_SIGNIN_URL: https://accounts.copiloto.ai/v1/sign-in
       COPILOTO_API_BASE: https://api.copiloto.ai
 
+      # =========================
+      # Comando RESET (2x/día)
+      # =========================
       COPILOTO_COMMAND_TEMPLATE: "AT+GTDAT=gv300w,1,,CMD97,0,,,,FFFF$"
 
+      # =========================
+      # Ventana días (targets)
+      # =========================
       MIN_DAYS: "15"
       MAX_DAYS: "30"
 
+      # =========================
+      # Performance
+      # =========================
       HTTP_TIMEOUT: "20"
       SLEEP_BETWEEN_SENDS_SEC: "0.3"
 
@@ -55,57 +64,37 @@ jobs:
           python -m pip install --upgrade pip
           pip install pandas requests openpyxl
 
-      - name: Run daily reboot script
+      - name: Run send script
         run: |
           python scripts/send_daily.py
 
-      - name: Commit generated reports (if changed)
+      - name: Commit generated outputs (safe push)
         run: |
+          set -e
           git config user.name "github-actions"
           git config user.email "github-actions@github.com"
+
+          # Evita non-fast-forward si otro run empujó cambios
+          git pull --rebase origin main
+
           git add .
-          git diff --cached --quiet || git commit -m "Auto update (send) $(date -u +'%Y-%m-%d %H:%M:%S')"
-          git push
 
-  verify_reconnect:
-    name: Verify reconnection (2x/day)
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event.schedule == '0 */12 * * *' }}
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
 
-    env:
-      COPILOTO_EMAIL: ${{ secrets.COPILOTO_EMAIL }}
-      COPILOTO_PASSWORD: ${{ secrets.COPILOTO_PASSWORD }}
-      COPILOTO_SIGNIN_URL: https://accounts.copiloto.ai/v1/sign-in
+          git commit -m "Auto update (send) $(date -u +'%Y-%m-%d %H:%M:%S')"
 
-      HTTP_TIMEOUT: "20"
-      VERIFY_MAX_HOURS_WAIT: "72"
+          # Push con reintentos (por carreras)
+          for i in 1 2 3; do
+            if git push origin main; then
+              echo "Pushed OK"
+              exit 0
+            fi
+            echo "Push failed, retry $i..."
+            git pull --rebase origin main
+          done
 
-    steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
-        with:
-          persist-credentials: true
-          fetch-depth: 0
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install pandas requests openpyxl
-
-      - name: Run verify reconnect
-        run: |
-          python scripts/verify_reconnect.py
-
-      - name: Commit verify results (if changed)
-        run: |
-          git config user.name "github-actions"
-          git config user.email "github-actions@github.com"
-          git add .
-          git diff --cached --quiet || git commit -m "Auto update (verify) $(date -u +'%Y-%m-%d %H:%M:%S')"
-          git push
+          echo "Push failed after retries."
+          exit 1
