@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import os
 import time
 import hashlib
@@ -43,7 +44,7 @@ MIN_DAYS = int(os.getenv("MIN_DAYS", "15"))
 MAX_DAYS = int(os.getenv("MAX_DAYS", "30"))
 
 # =========================
-# Copiloto (Auth + Download CSV + Send Command)
+# Copiloto
 # =========================
 COPILOTO_ENDPOINT = os.getenv(
     "COPILOTO_ENDPOINT",
@@ -57,14 +58,13 @@ COPILOTO_PASSWORD = os.getenv("COPILOTO_PASSWORD", "").strip()
 COPILOTO_API_BASE = os.getenv("COPILOTO_API_BASE", "https://api.copiloto.ai").strip().rstrip("/")
 COPILOTO_COMMAND_ENDPOINT_TMPL = os.getenv("COPILOTO_COMMAND_ENDPOINT_TMPL", "/command/{imei}").strip()
 
-# comando a enviar por API Copiloto
+HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "20"))
+SLEEP_BETWEEN_SENDS_SEC = float(os.getenv("SLEEP_BETWEEN_SENDS_SEC", "0.25"))
+
 API_COMMAND = os.getenv(
     "COPILOTO_COMMAND_TEMPLATE",
     "AT+GTDAT=gv300w,1,,CMD97,0,,,,FFFF$"
 ).strip()
-
-HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "20"))
-SLEEP_BETWEEN_SENDS_SEC = float(os.getenv("SLEEP_BETWEEN_SENDS_SEC", "0.25"))
 
 # =========================
 # Master columns
@@ -105,7 +105,6 @@ def norm_str(x: Any) -> str:
 
 def is_valid_imei(x: str) -> bool:
     s = (x or "").strip()
-    # IMEI suele ser 15; a veces viene 14/16 en algunos flujos, pero validemos dígitos.
     return s.isdigit() and 14 <= len(s) <= 17
 
 def make_session() -> requests.Session:
@@ -144,20 +143,20 @@ def append_row(path: Path, row: Dict[str, Any], cols: List[str]) -> None:
     df.to_csv(path, index=False)
 
 # =========================
-# Copiloto Auth + Download CSV + Send Command
+# Copiloto
 # =========================
-def fetch_copiloto_token(email: str, password: str, session: Optional[requests.Session] = None) -> str:
+def fetch_copiloto_token(email: str, password: str, session: requests.Session) -> str:
     if not email or not password:
         raise RuntimeError("Faltan COPILOTO_EMAIL/COPILOTO_PASSWORD.")
 
-    sess = session or make_session()
-    r = sess.post(COPILOTO_SIGNIN_URL, json={"email": email, "password": password}, timeout=45)
+    r = session.post(COPILOTO_SIGNIN_URL, json={"email": email, "password": password}, timeout=45)
     if r.status_code in (401, 403):
         raise RuntimeError("Credenciales Copiloto inválidas (401/403).")
     r.raise_for_status()
     data = r.json()
 
-    token = (data.get("token") or (data.get("data") or {}).get("token") or "").strip()
+    token = (data.get("data") or {}).get("token") or data.get("token") or ""
+    token = str(token).strip()
     if not token:
         raise RuntimeError("No encontré token en respuesta login Copiloto (data.token).")
     return token
@@ -180,17 +179,7 @@ def compute_days_disconnected(df: pd.DataFrame) -> pd.DataFrame:
 def build_command_url(imei: str) -> str:
     return f"{COPILOTO_API_BASE}{COPILOTO_COMMAND_ENDPOINT_TMPL.format(imei=imei)}"
 
-def send_command_to_imei(
-    token: str,
-    imei: str,
-    command: str,
-    session: requests.Session,
-) -> Tuple[bool, int, str]:
-    """
-    Envía comando vía Copiloto API:
-      POST https://api.copiloto.ai/command/{imei}
-      body: {"command":"..."}
-    """
+def send_command_to_imei(token: str, imei: str, command: str, session: requests.Session) -> Tuple[bool, int, str]:
     url = build_command_url(imei)
     headers = {
         "Authorization": f"Bearer {token}",
@@ -200,12 +189,11 @@ def send_command_to_imei(
     payload = {"command": command}
     r = session.post(url, headers=headers, json=payload, timeout=HTTP_TIMEOUT)
     ok = r.status_code in (200, 201, 202)
-    # guardamos cuerpo (truncado) como txid/nota (a veces devuelve id)
     text = (r.text or "").strip()
     return ok, r.status_code, text[:2000]
 
 # =========================
-# Reincidencia (upsert)
+# Reincidencia (upsert) - FIX dtype
 # =========================
 REINC_COLS = [
     "imei",
@@ -224,6 +212,17 @@ REINC_COLS = [
     "patente_last",
 ]
 
+def _to_int(x: Any) -> int:
+    try:
+        if x is None:
+            return 0
+        s = str(x).strip()
+        if s == "" or s.lower() == "nan":
+            return 0
+        return int(float(s))
+    except Exception:
+        return 0
+
 def update_reincidencia(hist_path: Path, rows_sent: List[Dict[str, Any]]) -> None:
     df_hist = load_csv_or_empty(hist_path, REINC_COLS)
     if df_hist.empty:
@@ -234,27 +233,37 @@ def update_reincidencia(hist_path: Path, rows_sent: List[Dict[str, Any]]) -> Non
         df_hist.to_csv(hist_path, index=False)
         return
 
+    # asegurar columnas en ambos
     for c in REINC_COLS:
+        if c not in df_hist.columns:
+            df_hist[c] = ""
         if c not in df_new.columns:
             df_new[c] = ""
 
-    df_hist["imei"] = df_hist["imei"].astype(str)
-    df_new["imei"] = df_new["imei"].astype(str)
+    # ✅ fuerza a texto (evita float64 vs "")
+    df_hist = df_hist.astype("string")
+    df_new = df_new.astype("string")
+
+    df_hist["imei"] = df_hist["imei"].fillna("").astype("string")
+    df_new["imei"] = df_new["imei"].fillna("").astype("string")
 
     df_hist = df_hist.set_index("imei", drop=False)
 
     for _, r in df_new.iterrows():
-        imei = str(r["imei"])
-        today = r.get("last_sent_date") or today_str()
+        imei = str(r.get("imei", "")).strip()
+        if not imei:
+            continue
+
+        today = str(r.get("last_sent_date") or today_str())
 
         if imei not in df_hist.index:
             df_hist.loc[imei, :] = {
                 "imei": imei,
                 "first_sent_date": today,
                 "last_sent_date": today,
-                "send_count_total": 0,
-                "send_count_ok": 0,
-                "send_count_err": 0,
+                "send_count_total": "0",
+                "send_count_ok": "0",
+                "send_count_err": "0",
                 "last_status": "",
                 "last_http_code": "",
                 "last_txid": "",
@@ -265,23 +274,25 @@ def update_reincidencia(hist_path: Path, rows_sent: List[Dict[str, Any]]) -> Non
                 "patente_last": "",
             }
 
+        # incrementos (guardados como string)
         df_hist.loc[imei, "last_sent_date"] = today
-        df_hist.loc[imei, "send_count_total"] = int(df_hist.loc[imei, "send_count_total"]) + 1
+        df_hist.loc[imei, "send_count_total"] = str(_to_int(df_hist.loc[imei, "send_count_total"]) + 1)
 
-        status = str(r.get("last_status", ""))
+        status = str(r.get("last_status", "") or "")
         if status == "OK":
-            df_hist.loc[imei, "send_count_ok"] = int(df_hist.loc[imei, "send_count_ok"]) + 1
+            df_hist.loc[imei, "send_count_ok"] = str(_to_int(df_hist.loc[imei, "send_count_ok"]) + 1)
         else:
-            df_hist.loc[imei, "send_count_err"] = int(df_hist.loc[imei, "send_count_err"]) + 1
+            df_hist.loc[imei, "send_count_err"] = str(_to_int(df_hist.loc[imei, "send_count_err"]) + 1)
 
+        # últimos valores
         df_hist.loc[imei, "last_status"] = status
-        df_hist.loc[imei, "last_http_code"] = r.get("last_http_code", "")
-        df_hist.loc[imei, "last_txid"] = r.get("last_txid", "")
-        df_hist.loc[imei, "last_command"] = r.get("last_command", "")
-        df_hist.loc[imei, "last_days_disconnected"] = r.get("last_days_disconnected", "")
-        df_hist.loc[imei, "vin_last"] = r.get("vin_last", "")
-        df_hist.loc[imei, "empresa_last"] = r.get("empresa_last", "")
-        df_hist.loc[imei, "patente_last"] = r.get("patente_last", "")
+        df_hist.loc[imei, "last_http_code"] = str(r.get("last_http_code", "") or "")
+        df_hist.loc[imei, "last_txid"] = str(r.get("last_txid", "") or "")
+        df_hist.loc[imei, "last_command"] = str(r.get("last_command", "") or "")
+        df_hist.loc[imei, "last_days_disconnected"] = str(r.get("last_days_disconnected", "") or "")
+        df_hist.loc[imei, "vin_last"] = str(r.get("vin_last", "") or "")
+        df_hist.loc[imei, "empresa_last"] = str(r.get("empresa_last", "") or "")
+        df_hist.loc[imei, "patente_last"] = str(r.get("patente_last", "") or "")
 
     df_hist = df_hist.reset_index(drop=True)
     df_hist.to_csv(hist_path, index=False)
@@ -322,7 +333,6 @@ def main():
     csv_path = download_copiloto_csv(COPILOTO_CSV_PATH)
     df_csv = pd.read_csv(csv_path)
 
-    # filtros
     df_csv = df_csv[
         df_csv["source"].astype(str).str.strip().str.upper().eq(CSV_FILTER_SOURCE) &
         df_csv["device_model"].astype(str).str.strip().str.upper().eq(CSV_FILTER_MODEL)
@@ -382,6 +392,7 @@ def main():
         empresa = norm_str(r.get(XLS_COL_EMPRESA))
         patente = norm_str(r.get(XLS_COL_PATENTE))
         days = r.get("days_disconnected")
+        last_seen_before = norm_str(r.get(CSV_LASTSEEN_COL))
 
         dkey = make_dedupe_key(imei, API_COMMAND, date_str)
         already = (df_sentlog["dedupe_key"] == dkey).any() if not df_sentlog.empty else False
@@ -390,22 +401,31 @@ def main():
 
         ok, code, resp_text = send_command_to_imei(copiloto_token, imei, API_COMMAND, session=session)
         status = "OK" if ok else "ERR"
-        txid = resp_text  # acá puede venir id o mensaje completo
+        txid = resp_text.strip()
 
         append_row(SENT_LOG, {
-            "date": date_str, "imei": imei,
-            "command": API_COMMAND, "dedupe_key": dkey,
-            "status": status, "http_code": code,
+            "date": date_str,
+            "imei": imei,
+            "command": API_COMMAND,
+            "dedupe_key": dkey,
+            "status": status,
+            "http_code": code,
             "txid": txid[:500],
             "note": resp_text[:500],
         }, sent_cols)
 
         run_rows.append({
-            "run_ts_utc": run_ts_str(), "date": date_str,
-            "imei": imei, "vin": vin,
-            "empresa": empresa, "patente": patente,
-            "days_disconnected": days, "command": API_COMMAND,
-            "status": status, "http_code": code,
+            "run_ts_utc": run_ts_str(),
+            "date": date_str,
+            "imei": imei,
+            "vin": vin,
+            "empresa": empresa,
+            "patente": patente,
+            "days_disconnected": days,
+            "last_seen_before_utc": last_seen_before,
+            "command": API_COMMAND,
+            "status": status,
+            "http_code": code,
             "txid": txid[:500],
             "note": resp_text[:500],
         })
@@ -427,10 +447,13 @@ def main():
             "date": date_str,
             "run_ts_utc": run_ts_str(),
             "imei": imei,
-            "txid": txid[:500],
+            "sent_at_utc": now_utc().isoformat(),
+            "last_seen_before_utc": last_seen_before,
+            "days_disconnected_at_send": days,
+            "vin": vin,
+            "empresa": empresa,
+            "patente": patente,
             "command": API_COMMAND,
-            "http_code": code,
-            "status": status,
         })
 
         time.sleep(SLEEP_BETWEEN_SENDS_SEC)
