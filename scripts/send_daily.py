@@ -43,31 +43,28 @@ MIN_DAYS = int(os.getenv("MIN_DAYS", "15"))
 MAX_DAYS = int(os.getenv("MAX_DAYS", "30"))
 
 # =========================
-# Copiloto
+# Copiloto (Auth + Download CSV + Send Command)
 # =========================
 COPILOTO_ENDPOINT = os.getenv(
     "COPILOTO_ENDPOINT",
     "https://api.copiloto.ai/wicar-report/report-files/vehicle-records"
 ).strip()
+
 COPILOTO_SIGNIN_URL = os.getenv("COPILOTO_SIGNIN_URL", "https://accounts.copiloto.ai/v1/sign-in").strip()
 COPILOTO_EMAIL = os.getenv("COPILOTO_EMAIL", "").strip()
 COPILOTO_PASSWORD = os.getenv("COPILOTO_PASSWORD", "").strip()
 
-# =========================
-# Monogoto
-# =========================
-MNG_BASE_URL = os.getenv("MNG_BASE_URL", "https://console.monogoto.io").strip()
-MNG_USERNAME = os.getenv("MONOGOTO_USER", "").strip()
-MNG_PASSWORD = os.getenv("MONOGOTO_PASS", "").strip()
+COPILOTO_API_BASE = os.getenv("COPILOTO_API_BASE", "https://api.copiloto.ai").strip().rstrip("/")
+COPILOTO_COMMAND_ENDPOINT_TMPL = os.getenv("COPILOTO_COMMAND_ENDPOINT_TMPL", "/command/{imei}").strip()
+
+# comando a enviar por API Copiloto
+API_COMMAND = os.getenv(
+    "COPILOTO_COMMAND_TEMPLATE",
+    "AT+GTDAT=gv300w,1,,CMD97,0,,,,FFFF$"
+).strip()
+
 HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "20"))
 SLEEP_BETWEEN_SENDS_SEC = float(os.getenv("SLEEP_BETWEEN_SENDS_SEC", "0.25"))
-TOKEN_TTL_MIN = int(os.getenv("MONOGOTO_TOKEN_TTL_MIN", "20"))
-_TOKEN_CACHE = {"token": None, "exp": 0.0}
-
-SMS_COMMAND = os.getenv(
-    "SMS_COMMAND",
-    "AT+GTDAT=gv300w,1,,CMD2112,0,,,,FFFF$"
-).strip()
 
 # =========================
 # Master columns
@@ -106,6 +103,11 @@ def norm_str(x: Any) -> str:
         return ""
     return str(x).strip()
 
+def is_valid_imei(x: str) -> bool:
+    s = (x or "").strip()
+    # IMEI suele ser 15; a veces viene 14/16 en algunos flujos, pero validemos dígitos.
+    return s.isdigit() and 14 <= len(s) <= 17
+
 def make_session() -> requests.Session:
     s = requests.Session()
     retries = Retry(
@@ -116,7 +118,7 @@ def make_session() -> requests.Session:
     )
     s.mount("https://", HTTPAdapter(max_retries=retries))
     s.mount("http://", HTTPAdapter(max_retries=retries))
-    s.headers.update({"User-Agent": "iot-reboot-cron/1.0"})
+    s.headers.update({"User-Agent": "iot-reboot-cron/2.0"})
     return s
 
 def save_run_report(df: pd.DataFrame) -> Path:
@@ -142,31 +144,27 @@ def append_row(path: Path, row: Dict[str, Any], cols: List[str]) -> None:
     df.to_csv(path, index=False)
 
 # =========================
-# Copiloto
+# Copiloto Auth + Download CSV + Send Command
 # =========================
-def fetch_copiloto_token(email: str, password: str) -> str:
+def fetch_copiloto_token(email: str, password: str, session: Optional[requests.Session] = None) -> str:
     if not email or not password:
         raise RuntimeError("Faltan COPILOTO_EMAIL/COPILOTO_PASSWORD.")
 
-    sess = make_session()
+    sess = session or make_session()
     r = sess.post(COPILOTO_SIGNIN_URL, json={"email": email, "password": password}, timeout=45)
     if r.status_code in (401, 403):
         raise RuntimeError("Credenciales Copiloto inválidas (401/403).")
     r.raise_for_status()
     data = r.json()
-    token = (
-        data.get("accessToken") or data.get("access_token") or data.get("token")
-        or (data.get("data") or {}).get("token")
-        or (data.get("data") or {}).get("accessToken")
-        or ""
-    )
+
+    token = (data.get("token") or (data.get("data") or {}).get("token") or "").strip()
     if not token:
-        raise RuntimeError("No encontré token en respuesta login Copiloto.")
-    return token.strip()
+        raise RuntimeError("No encontré token en respuesta login Copiloto (data.token).")
+    return token
 
 def download_copiloto_csv(out_path: Path) -> Path:
     sess = make_session()
-    token = fetch_copiloto_token(COPILOTO_EMAIL, COPILOTO_PASSWORD)
+    token = fetch_copiloto_token(COPILOTO_EMAIL, COPILOTO_PASSWORD, session=sess)
     r = sess.get(COPILOTO_ENDPOINT, headers={"Authorization": f"Bearer {token}"}, timeout=90)
     r.raise_for_status()
     out_path.write_bytes(r.content)
@@ -179,51 +177,32 @@ def compute_days_disconnected(df: pd.DataFrame) -> pd.DataFrame:
     out["days_disconnected"] = ((now_utc() - out["_last_seen"]).dt.total_seconds() / 86400.0).round(0)
     return out
 
-# =========================
-# Monogoto
-# =========================
-def login_get_token() -> str:
-    url = f"{MNG_BASE_URL.rstrip('/')}/Auth"
-    payload = {"UserName": MNG_USERNAME, "Password": MNG_PASSWORD}
-    r = requests.post(url, json=payload, timeout=HTTP_TIMEOUT)
-    if r.status_code != 200:
-        raise RuntimeError(f"Login Monogoto falló ({r.status_code}): {r.text}")
-    data = r.json()
-    token = data.get("token") or data.get("Token")
-    if not token:
-        raise RuntimeError("Login Monogoto sin token.")
-    return token
+def build_command_url(imei: str) -> str:
+    return f"{COPILOTO_API_BASE}{COPILOTO_COMMAND_ENDPOINT_TMPL.format(imei=imei)}"
 
-def get_token_cached() -> str:
-    now = time.time()
-    if _TOKEN_CACHE["token"] and now < _TOKEN_CACHE["exp"]:
-        return _TOKEN_CACHE["token"]
-    if not MNG_USERNAME or not MNG_PASSWORD:
-        raise RuntimeError("Faltan MONOGOTO_USER / MONOGOTO_PASS.")
-    token = login_get_token()
-    _TOKEN_CACHE["token"] = token
-    _TOKEN_CACHE["exp"] = now + TOKEN_TTL_MIN * 60
-    return token
-
-def get_iccid_by_imei(token: str, imei: str, session: requests.Session) -> Optional[str]:
-    url = f"{MNG_BASE_URL.rstrip('/')}/things"
-    params = {"filterBy[IMEI]": imei.strip(), "limit": 1}
-    headers = {"Authorization": f"Bearer {token}", "accept": "application/json"}
-    r = session.get(url, headers=headers, params=params, timeout=HTTP_TIMEOUT)
-    if r.status_code != 200:
-        raise RuntimeError(f"GET /things error ({r.status_code}): {r.text}")
-    items = r.json()
-    if not isinstance(items, list) or not items:
-        return None
-    return items[0].get("ExternalUniqueId") or items[0].get("ICCID")
-
-def send_sms_to_iccid(token: str, iccid: str, message: str, session: requests.Session) -> Tuple[bool, int, str]:
-    url = f"{MNG_BASE_URL.rstrip('/')}/thing/ThingId_ICCID_{iccid}/sms"
-    headers = {"Authorization": f"Bearer {token}", "accept": "application/json", "Content-Type": "application/json"}
-    payload = {"Message": message, "From": "console"}
+def send_command_to_imei(
+    token: str,
+    imei: str,
+    command: str,
+    session: requests.Session,
+) -> Tuple[bool, int, str]:
+    """
+    Envía comando vía Copiloto API:
+      POST https://api.copiloto.ai/command/{imei}
+      body: {"command":"..."}
+    """
+    url = build_command_url(imei)
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    }
+    payload = {"command": command}
     r = session.post(url, headers=headers, json=payload, timeout=HTTP_TIMEOUT)
     ok = r.status_code in (200, 201, 202)
-    return ok, r.status_code, (r.text or "").strip()
+    # guardamos cuerpo (truncado) como txid/nota (a veces devuelve id)
+    text = (r.text or "").strip()
+    return ok, r.status_code, text[:2000]
 
 # =========================
 # Reincidencia (upsert)
@@ -243,7 +222,6 @@ REINC_COLS = [
     "vin_last",
     "empresa_last",
     "patente_last",
-    "iccid_last",
 ]
 
 def update_reincidencia(hist_path: Path, rows_sent: List[Dict[str, Any]]) -> None:
@@ -256,7 +234,6 @@ def update_reincidencia(hist_path: Path, rows_sent: List[Dict[str, Any]]) -> Non
         df_hist.to_csv(hist_path, index=False)
         return
 
-    # asegurar columnas
     for c in REINC_COLS:
         if c not in df_new.columns:
             df_new[c] = ""
@@ -286,10 +263,8 @@ def update_reincidencia(hist_path: Path, rows_sent: List[Dict[str, Any]]) -> Non
                 "vin_last": "",
                 "empresa_last": "",
                 "patente_last": "",
-                "iccid_last": "",
             }
 
-        # incrementos
         df_hist.loc[imei, "last_sent_date"] = today
         df_hist.loc[imei, "send_count_total"] = int(df_hist.loc[imei, "send_count_total"]) + 1
 
@@ -299,7 +274,6 @@ def update_reincidencia(hist_path: Path, rows_sent: List[Dict[str, Any]]) -> Non
         else:
             df_hist.loc[imei, "send_count_err"] = int(df_hist.loc[imei, "send_count_err"]) + 1
 
-        # últimos valores
         df_hist.loc[imei, "last_status"] = status
         df_hist.loc[imei, "last_http_code"] = r.get("last_http_code", "")
         df_hist.loc[imei, "last_txid"] = r.get("last_txid", "")
@@ -308,7 +282,6 @@ def update_reincidencia(hist_path: Path, rows_sent: List[Dict[str, Any]]) -> Non
         df_hist.loc[imei, "vin_last"] = r.get("vin_last", "")
         df_hist.loc[imei, "empresa_last"] = r.get("empresa_last", "")
         df_hist.loc[imei, "patente_last"] = r.get("patente_last", "")
-        df_hist.loc[imei, "iccid_last"] = r.get("iccid_last", "")
 
     df_hist = df_hist.reset_index(drop=True)
     df_hist.to_csv(hist_path, index=False)
@@ -319,10 +292,8 @@ def update_reincidencia(hist_path: Path, rows_sent: List[Dict[str, Any]]) -> Non
 def main():
     if not COPILOTO_EMAIL or not COPILOTO_PASSWORD:
         raise RuntimeError("Faltan COPILOTO_EMAIL / COPILOTO_PASSWORD.")
-    if not MNG_USERNAME or not MNG_PASSWORD:
-        raise RuntimeError("Faltan MONOGOTO_USER / MONOGOTO_PASS.")
 
-    log.info("SMS_COMMAND: %s", SMS_COMMAND)
+    log.info("API_COMMAND: %s", API_COMMAND)
 
     # 1) Master
     df_master = pd.read_excel(EXCEL_PATH, sheet_name=EXCEL_SHEET)
@@ -351,6 +322,7 @@ def main():
     csv_path = download_copiloto_csv(COPILOTO_CSV_PATH)
     df_csv = pd.read_csv(csv_path)
 
+    # filtros
     df_csv = df_csv[
         df_csv["source"].astype(str).str.strip().str.upper().eq(CSV_FILTER_SOURCE) &
         df_csv["device_model"].astype(str).str.strip().str.upper().eq(CSV_FILTER_MODEL)
@@ -386,17 +358,19 @@ def main():
     # IMEI del CSV
     df_targets["_imei_send"] = df_targets[CSV_COL_IMEI].astype(str).str.strip()
     df_targets = df_targets[df_targets["_imei_send"].str.lower().ne("nan") & df_targets["_imei_send"].ne("")].copy()
+    df_targets = df_targets[df_targets["_imei_send"].apply(is_valid_imei)].copy()
     if df_targets.empty:
+        log.info("Targets sin IMEI válido.")
         return
 
     # dedupe diario
-    sent_cols = ["date", "imei", "iccid", "command", "dedupe_key", "status", "http_code", "txid", "note"]
+    sent_cols = ["date", "imei", "command", "dedupe_key", "status", "http_code", "txid", "note"]
     df_sentlog = load_csv_or_empty(SENT_LOG, sent_cols)
     date_str = today_str()
 
     session = make_session()
-    token = get_token_cached()
-    log.info("Monogoto token OK. Envío ACTIVADO.")
+    copiloto_token = fetch_copiloto_token(COPILOTO_EMAIL, COPILOTO_PASSWORD, session=session)
+    log.info("Copiloto token OK. Envío ACTIVADO.")
 
     run_rows = []
     reinc_rows = []
@@ -409,83 +383,54 @@ def main():
         patente = norm_str(r.get(XLS_COL_PATENTE))
         days = r.get("days_disconnected")
 
-        dkey = make_dedupe_key(imei, SMS_COMMAND, date_str)
+        dkey = make_dedupe_key(imei, API_COMMAND, date_str)
         already = (df_sentlog["dedupe_key"] == dkey).any() if not df_sentlog.empty else False
         if already:
             continue
 
-        iccid = get_iccid_by_imei(token, imei, session=session)
-        if not iccid:
-            # registra intento fallido (sin iccid)
-            run_rows.append({
-                "run_ts_utc": run_ts_str(), "date": date_str,
-                "imei": imei, "iccid": "", "vin": vin,
-                "empresa": empresa, "patente": patente,
-                "days_disconnected": days, "command": SMS_COMMAND,
-                "status": "NOT_FOUND_ICCID", "http_code": 404, "txid": "", "note": "ICCID no encontrado"
-            })
-            reinc_rows.append({
-                "imei": imei,
-                "first_sent_date": "",
-                "last_sent_date": date_str,
-                "send_count_total": 1,
-                "send_count_ok": 0,
-                "send_count_err": 1,
-                "last_status": "ERR",
-                "last_http_code": 404,
-                "last_txid": "",
-                "last_command": SMS_COMMAND,
-                "last_days_disconnected": days,
-                "vin_last": vin,
-                "empresa_last": empresa,
-                "patente_last": patente,
-                "iccid_last": "",
-            })
-            time.sleep(SLEEP_BETWEEN_SENDS_SEC)
-            continue
-
-        ok, code, resp_text = send_sms_to_iccid(token, iccid, SMS_COMMAND, session=session)
+        ok, code, resp_text = send_command_to_imei(copiloto_token, imei, API_COMMAND, session=session)
         status = "OK" if ok else "ERR"
-        txid = resp_text.strip()
+        txid = resp_text  # acá puede venir id o mensaje completo
 
-        # guardar sentlog
         append_row(SENT_LOG, {
-            "date": date_str, "imei": imei, "iccid": iccid,
-            "command": SMS_COMMAND, "dedupe_key": dkey,
-            "status": status, "http_code": code, "txid": txid, "note": resp_text[:500]
+            "date": date_str, "imei": imei,
+            "command": API_COMMAND, "dedupe_key": dkey,
+            "status": status, "http_code": code,
+            "txid": txid[:500],
+            "note": resp_text[:500],
         }, sent_cols)
 
         run_rows.append({
             "run_ts_utc": run_ts_str(), "date": date_str,
-            "imei": imei, "iccid": iccid, "vin": vin,
+            "imei": imei, "vin": vin,
             "empresa": empresa, "patente": patente,
-            "days_disconnected": days, "command": SMS_COMMAND,
-            "status": status, "http_code": code, "txid": txid, "note": resp_text[:500]
+            "days_disconnected": days, "command": API_COMMAND,
+            "status": status, "http_code": code,
+            "txid": txid[:500],
+            "note": resp_text[:500],
         })
 
-        # update reincidencia (solo 1 fila por IMEI)
         reinc_rows.append({
             "imei": imei,
             "last_sent_date": date_str,
             "last_status": status,
             "last_http_code": code,
-            "last_txid": txid,
-            "last_command": SMS_COMMAND,
+            "last_txid": txid[:500],
+            "last_command": API_COMMAND,
             "last_days_disconnected": days,
             "vin_last": vin,
             "empresa_last": empresa,
             "patente_last": patente,
-            "iccid_last": iccid,
         })
 
-        # pending verify: guarda para validar después (job hourly)
         pending_rows.append({
             "date": date_str,
             "run_ts_utc": run_ts_str(),
             "imei": imei,
-            "iccid": iccid,
-            "txid": txid,
-            "command": SMS_COMMAND,
+            "txid": txid[:500],
+            "command": API_COMMAND,
+            "http_code": code,
+            "status": status,
         })
 
         time.sleep(SLEEP_BETWEEN_SENDS_SEC)
@@ -494,11 +439,9 @@ def main():
     report_path = save_run_report(df_run)
     log.info("Reporte del run: %s (rows=%d)", report_path, len(df_run))
 
-    # actualizar reincidencia
     update_reincidencia(HIST_REINCIDENCIA, reinc_rows)
     log.info("Reincidencia actualizada: %s", HIST_REINCIDENCIA)
 
-    # guardar pending_verify (se sobreescribe cada día, y el verificador puede ir consumiendo)
     df_pending = pd.DataFrame(pending_rows)
     df_pending.to_csv(PENDING_VERIFY, index=False)
     log.info("Pending verify guardado: %s (rows=%d)", PENDING_VERIFY, len(df_pending))
