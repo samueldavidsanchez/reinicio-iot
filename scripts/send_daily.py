@@ -7,6 +7,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple, List
 
+from zoneinfo import ZoneInfo
+
 import pandas as pd
 import requests
 from requests.adapters import HTTPAdapter
@@ -14,6 +16,33 @@ from urllib3.util.retry import Retry
 
 log = logging.getLogger("send_daily")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+
+# =========================
+# TZ Chile (para dedupe 2x/día y fecha local)
+# =========================
+TZ_CL = ZoneInfo("America/Santiago")
+
+def now_cl() -> datetime:
+    return datetime.now(TZ_CL)
+
+def today_str_cl() -> str:
+    return now_cl().strftime("%Y-%m-%d")
+
+def slot_str_cl() -> str:
+    """
+    Slot del día para permitir 2 envíos diarios.
+    - AM: antes de 15:00 hora Chile
+    - PM: desde 15:00 hora Chile
+    (Tus cron ~12:00 y ~18:00 caen en slots distintos)
+    """
+    h = now_cl().hour
+    return "AM" if h < 15 else "PM"
+
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+def run_ts_str() -> str:
+    return now_utc().strftime("%Y-%m-%d_%H%M%S")
 
 # =========================
 # Paths
@@ -34,7 +63,7 @@ RUN_REPORT_PREFIX = os.getenv("RUN_REPORT_PREFIX", "report_").strip()
 HIST_REINCIDENCIA = Path(os.getenv("HIST_REINCIDENCIA", str(OUT_DIR / "historico_reincidencia.csv")))
 PENDING_VERIFY = Path(os.getenv("PENDING_VERIFY", str(OUT_DIR / "pending_verify.csv")))
 
-# Dedupe diario (evita mandar 2 veces mismo día al mismo IMEI)
+# Dedupe diario (evita mandar 2 veces en el mismo slot al mismo IMEI)
 SENT_LOG = Path(os.getenv("SENT_LOG_PATH", str(OUT_DIR / "sent_commands.csv")))
 
 # =========================
@@ -87,17 +116,8 @@ CSV_FILTER_SOURCE = os.getenv("CSV_FILTER_SOURCE", "COPILOTO").strip().upper()
 CSV_FILTER_MODEL = os.getenv("CSV_FILTER_MODEL", "GV300W").strip().upper()
 
 # =========================
-# Helpers
+# Generic helpers
 # =========================
-def now_utc() -> datetime:
-    return datetime.now(timezone.utc)
-
-def today_str() -> str:
-    return now_utc().strftime("%Y-%m-%d")
-
-def run_ts_str() -> str:
-    return now_utc().strftime("%Y-%m-%d_%H%M%S")
-
 def norm_str(x: Any) -> str:
     if x is None:
         return ""
@@ -125,8 +145,8 @@ def save_run_report(df: pd.DataFrame) -> Path:
     df.to_csv(out, index=False)
     return out
 
-def make_dedupe_key(imei: str, command: str, date_str: str) -> str:
-    raw = f"{imei}|{command}|{date_str}"
+def make_dedupe_key(imei: str, command: str, date_slot: str) -> str:
+    raw = f"{imei}|{command}|{date_slot}"
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 def load_csv_or_empty(path: Path, cols: List[str]) -> pd.DataFrame:
@@ -233,14 +253,13 @@ def update_reincidencia(hist_path: Path, rows_sent: List[Dict[str, Any]]) -> Non
         df_hist.to_csv(hist_path, index=False)
         return
 
-    # asegurar columnas en ambos
     for c in REINC_COLS:
         if c not in df_hist.columns:
             df_hist[c] = ""
         if c not in df_new.columns:
             df_new[c] = ""
 
-    # ✅ fuerza a texto (evita float64 vs "")
+    # fuerza a texto (evita float64 vs "")
     df_hist = df_hist.astype("string")
     df_new = df_new.astype("string")
 
@@ -254,7 +273,7 @@ def update_reincidencia(hist_path: Path, rows_sent: List[Dict[str, Any]]) -> Non
         if not imei:
             continue
 
-        today = str(r.get("last_sent_date") or today_str())
+        today = str(r.get("last_sent_date") or today_str_cl())
 
         if imei not in df_hist.index:
             df_hist.loc[imei, :] = {
@@ -274,7 +293,6 @@ def update_reincidencia(hist_path: Path, rows_sent: List[Dict[str, Any]]) -> Non
                 "patente_last": "",
             }
 
-        # incrementos (guardados como string)
         df_hist.loc[imei, "last_sent_date"] = today
         df_hist.loc[imei, "send_count_total"] = str(_to_int(df_hist.loc[imei, "send_count_total"]) + 1)
 
@@ -284,7 +302,6 @@ def update_reincidencia(hist_path: Path, rows_sent: List[Dict[str, Any]]) -> Non
         else:
             df_hist.loc[imei, "send_count_err"] = str(_to_int(df_hist.loc[imei, "send_count_err"]) + 1)
 
-        # últimos valores
         df_hist.loc[imei, "last_status"] = status
         df_hist.loc[imei, "last_http_code"] = str(r.get("last_http_code", "") or "")
         df_hist.loc[imei, "last_txid"] = str(r.get("last_txid", "") or "")
@@ -304,7 +321,11 @@ def main():
     if not COPILOTO_EMAIL or not COPILOTO_PASSWORD:
         raise RuntimeError("Faltan COPILOTO_EMAIL / COPILOTO_PASSWORD.")
 
+    date_str = today_str_cl()
+    slot = slot_str_cl()
+
     log.info("API_COMMAND: %s", API_COMMAND)
+    log.info("Run date (CL): %s | slot: %s", date_str, slot)
 
     # 1) Master
     df_master = pd.read_excel(EXCEL_PATH, sheet_name=EXCEL_SHEET)
@@ -373,10 +394,9 @@ def main():
         log.info("Targets sin IMEI válido.")
         return
 
-    # dedupe diario
-    sent_cols = ["date", "imei", "command", "dedupe_key", "status", "http_code", "txid", "note"]
+    # dedupe por slot (AM/PM CL)
+    sent_cols = ["date", "slot", "imei", "command", "dedupe_key", "status", "http_code", "txid", "note"]
     df_sentlog = load_csv_or_empty(SENT_LOG, sent_cols)
-    date_str = today_str()
 
     session = make_session()
     copiloto_token = fetch_copiloto_token(COPILOTO_EMAIL, COPILOTO_PASSWORD, session=session)
@@ -394,7 +414,8 @@ def main():
         days = r.get("days_disconnected")
         last_seen_before = norm_str(r.get(CSV_LASTSEEN_COL))
 
-        dkey = make_dedupe_key(imei, API_COMMAND, date_str)
+        # ✅ Dedupe por día+slot Chile
+        dkey = make_dedupe_key(imei, API_COMMAND, f"{date_str}-{slot}")
         already = (df_sentlog["dedupe_key"] == dkey).any() if not df_sentlog.empty else False
         if already:
             continue
@@ -405,6 +426,7 @@ def main():
 
         append_row(SENT_LOG, {
             "date": date_str,
+            "slot": slot,
             "imei": imei,
             "command": API_COMMAND,
             "dedupe_key": dkey,
@@ -417,6 +439,7 @@ def main():
         run_rows.append({
             "run_ts_utc": run_ts_str(),
             "date": date_str,
+            "slot": slot,
             "imei": imei,
             "vin": vin,
             "empresa": empresa,
@@ -445,6 +468,7 @@ def main():
 
         pending_rows.append({
             "date": date_str,
+            "slot": slot,
             "run_ts_utc": run_ts_str(),
             "imei": imei,
             "sent_at_utc": now_utc().isoformat(),

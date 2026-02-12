@@ -3,6 +3,13 @@ import pandas as pd
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from zoneinfo import ZoneInfo
+TZ_CL = ZoneInfo("America/Santiago")
+
+def slot_str_cl() -> str:
+    h = datetime.now(TZ_CL).hour
+    return "AM" if h < 15 else "PM"  # 12:00 y 18:00 caen en slots distintos
+
 st.set_page_config(page_title="IoT Reboots Dashboard", layout="wide")
 st.title("📡 Dashboard — Reinicios IoT (Monogoto)")
 

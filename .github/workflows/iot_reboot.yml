@@ -22,28 +22,17 @@ jobs:
     timeout-minutes: 45
 
     env:
-      # =========================
-      # Copiloto Auth
-      # =========================
       COPILOTO_EMAIL: ${{ secrets.COPILOTO_EMAIL }}
       COPILOTO_PASSWORD: ${{ secrets.COPILOTO_PASSWORD }}
       COPILOTO_SIGNIN_URL: https://accounts.copiloto.ai/v1/sign-in
       COPILOTO_API_BASE: https://api.copiloto.ai
 
-      # =========================
-      # Comando RESET (2x/día)
-      # =========================
+      # RESET command
       COPILOTO_COMMAND_TEMPLATE: "AT+GTDAT=gv300w,1,,CMD97,0,,,,FFFF$"
 
-      # =========================
-      # Ventana días (targets)
-      # =========================
       MIN_DAYS: "15"
       MAX_DAYS: "30"
 
-      # =========================
-      # Performance
-      # =========================
       HTTP_TIMEOUT: "20"
       SLEEP_BETWEEN_SENDS_SEC: "0.3"
 
@@ -68,17 +57,24 @@ jobs:
         run: |
           python scripts/send_daily.py
 
-      - name: Commit generated outputs (safe push)
+      - name: Commit generated outputs (stash + rebase + retry push)
         run: |
           set -e
           git config user.name "github-actions"
           git config user.email "github-actions@github.com"
 
-          # Evita non-fast-forward si otro run empujó cambios
+          # 1) Stash cambios generados por el script (incluye archivos nuevos)
+          git add -A
+          git stash push -u -m "generated outputs" || true
+
+          # 2) Traer cambios remotos sin chocar
           git pull --rebase origin main
 
-          git add .
+          # 3) Re-aplicar outputs
+          git stash pop || true
 
+          # 4) Commit si hay cambios
+          git add -A
           if git diff --cached --quiet; then
             echo "No changes to commit."
             exit 0
@@ -86,7 +82,7 @@ jobs:
 
           git commit -m "Auto update (send) $(date -u +'%Y-%m-%d %H:%M:%S')"
 
-          # Push con reintentos (por carreras)
+          # 5) Push con reintentos (por carreras)
           for i in 1 2 3; do
             if git push origin main; then
               echo "Pushed OK"
