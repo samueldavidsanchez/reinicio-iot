@@ -7,8 +7,6 @@ on:
   schedule:
     # 12:00 Chile ≈ 15:00 UTC
     - cron: "0 15 * * *"
-    # 18:00 Chile ≈ 21:00 UTC
-    - cron: "0 21 * * *"
   workflow_dispatch: {}
 
 concurrency:
